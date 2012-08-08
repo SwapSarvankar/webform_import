@@ -82,6 +82,10 @@ function webform_import_csvtemplate($node, $type) {
   $filename = check_plain($node->title) . '_upload.csv';
   $headers = array();
   $node->webform['components']['-1'] = array(
+    'name' => 'User ID',
+    'form_key' => 'UID',
+  );
+  $node->webform['components']['-2'] = array(
     'name' => 'Submission ID',
     'form_key' => 'SID',
   );
@@ -140,6 +144,7 @@ function webform_import_form(&$form_state, $node) {
   );
   $component_table_rows = array();
   $component_table_rows[] = array('Submission ID', 'SID');
+  $component_table_rows[] = array('User ID', 'UID');
   foreach ($node->webform['components'] as $cid => $component) {
     if ($component['type'] == 'file') {
       continue;
@@ -164,7 +169,7 @@ function webform_import_form(&$form_state, $node) {
     '#collapsible' => TRUE,
     '#collapsed' => TRUE,
   );
-  
+
   $instructions_items = array(
     array(
       'data' => 'Component specific help:',
@@ -177,13 +182,14 @@ function webform_import_form(&$form_state, $node) {
       ),
     ),
   );
-    
+
   $form['instructions']['instructions'] = array(
     '#value' => '<p>' . t('Webform import enables the upload of delimited files to fill in data.') . '</p>' .
     '<p>' . t('The file must use the following values for column headers, anything else will be ignored.') .
     theme('table', $component_table_header, $component_table_rows) .
-    '<small>' . t('* bold names are mandatory and must contain a value') . '</small></p><br/>' .
-    '<p>' . t('All rows with a submission id (SID) will be updated. Those without a submission id will be inserted.') . '</p><br/>' .
+    '<p><small>' . t('* bold names are mandatory and must contain a value') . '</small><br/>' .
+    '' . t('All rows with a submission id (SID) will be updated. Those without a submission id will be inserted.') . '<br/>' .
+    '' . t('All rows with a user id (UID) will be associated with that user. Those without a user id will use the default setting.') . '</p><br/>' .
     theme("item_list", $instructions_items, NULL, "ol"),
   );
 
@@ -199,6 +205,21 @@ function webform_import_form(&$form_state, $node) {
     '#default_value' => '\t',
     '#options' => _webform_import_delimiter_options(),
     '#description' => t('Delimiter for file being uploaded.'),
+  );
+
+  $users_list = array();
+  $result = db_query('SELECT uid, name FROM {users}');
+  while ($row = db_fetch_object($result)) {
+    if($row->uid == 0){ $row->name = "Anonymous";}
+    $users_list[$row->uid] = $row->name;
+  }
+
+  $form['default_user'] = array(
+    '#type' => 'select',
+    '#title' => t('Default User'),
+    '#default_value' => $user->uid,
+    '#options' => $users_list,
+    '#description' => t('Select the default user to associate the submissions with (unless specified in the file).'),
   );
 
   $form['field_keys'] = array(
@@ -249,9 +270,11 @@ function webform_import_form_submit($form, &$form_state) {
   $delimiter = $form_state['values']['delimiter'];
   $delimiter = $delimiter == '\t' ? '\t' : $delimiter;
   $field_key = $form_state['values']['field_keys'];
+  $default_user = $form_state['values']['default_user'];
 
   $keys = array();
   $keys[$field_key === 'name' ? 'Submission ID' : 'SID'] = array( 'form_key' => 'SID');
+  $keys[$field_key === 'name' ? 'User ID' : 'UID'] = array( 'form_key' => 'UID');
   foreach ($webform->webform['components'] as $cid => $component) {
     $component['cid'] = $cid;
     $keys[trim($component[$field_key])] = $component;
@@ -301,6 +324,7 @@ function webform_import_form_submit($form, &$form_state) {
         }
         $num = count($data);
         $sid = NULL;
+        $uid = NULL;
         if ($arraylen == $num) {
           $sub_array = array();
           foreach ($data as $k => &$v) {
@@ -324,6 +348,16 @@ function webform_import_form_submit($form, &$form_state) {
               }
               else {
                 $sid = intval($v); // Valid input security (integer values only).
+              }
+            }
+            // Checking UID input security.
+            elseif ($keys[$fields[$k]]['form_key'] === 'UID') {
+              if (!is_numeric($v)) {
+                drupal_set_message(t('Invalid User ID at row,col: @r,@c.  Skipping this row!', array('@r' => $c, '@c' => $k)), 'warning');
+                continue 2;
+              }
+              else {
+                $uid = intval($v); // Valid input security (integer values only).
               }
             }
             // It's a real component, parse and add to $sub_array.
@@ -350,7 +384,7 @@ function webform_import_form_submit($form, &$form_state) {
 
           $submission = (object) array(
             'nid' => $webform->nid,
-            'uid' => $user->uid,
+            'uid' => ( $uid != NULL ? $uid : $default_user ),
             'submitted' => time(),
             'remote_addr' => ip_address(),
             'is_draft' => FALSE,
