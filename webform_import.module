@@ -337,7 +337,7 @@ function webform_import_form_submit($form, &$form_state) {
 
       $fields = array_flip($data);
       foreach ($keys as $k => $component) {
-        if (!empty($component['mandatory']) && !isset($fields[$k])) {
+        if (!empty($component['mandatory']) && $component['type'] != 'fieldset' && !isset($fields[$k])) {
           form_set_error('upload', t('Column @k is required but could not be found in this file. Alter the file or the webform and try again.', array('@k' => $k)));
           return;
         }
