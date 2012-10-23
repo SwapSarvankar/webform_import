@@ -66,7 +66,46 @@ function webform_import_menu() {
     'access arguments' => array('update', 1),
     'type' => MENU_CALLBACK,
   );
+  $items['admin/settings/webform-import'] = array(
+    'title' => 'Webform Import',
+    'description' => 'Configure the settings used for webform import.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('webform_import_admin_settings'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+  );
   return $items;
+}
+
+/**
+ * Implements hook_admin_settings().
+ *
+ * Provide administrative options to configure webform imports functionality.
+ */
+function webform_import_admin_settings() {
+  $form = array();
+  $form['webform_import_queue_import'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Process imports via Queue'),
+    '#description' => t('Enable processing imports via Drupal Queue.'),
+    '#default_value' => variable_get('webform_import_queue_import', FALSE),
+    '#disabled' => !(module_exists('drupal_queue')),
+  );
+  $form['webform_import_num_per_queue'] = array(
+    '#type' => 'select',
+    '#title' => t('Lines per Queue entry'),
+    '#description' => t('The number of lines to process per entry in the Drupal Queue.'),
+    '#options' => array(100 => 100, 250 => 250, 500 => 500, 1000 => 1000, 2500 => 2500, 10000 => 10000),
+    '#default_value' => variable_get('webform_import_num_per_queue', 100),
+    '#disabled' => !(module_exists('drupal_queue')),
+  );
+  $form['webform_import_file_destination'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Upload destination'),
+    '#default_value' => variable_get('webform_import_file_destination', FALSE),
+    '#description' => t('The destination for webform import uploads.'),
+  );
+  return system_settings_form($form);
 }
 
 /**
@@ -240,7 +279,9 @@ function webform_import_form(&$form_state, $node) {
     '#type' => 'submit',
     '#value' => empty($node->webform['submit_text']) ? t('Submit') : $node->webform['submit_text'],
     '#weight' => 10,
+    '#attributes' => (variable_get('webform_import_queue_import', FALSE)) ? array('onclick' => "this.disabled=true;this.value='Queueing...';this.form.submit();") : NULL,
   );
+
   return $form;
 }
 
@@ -255,9 +296,7 @@ function webform_import_form(&$form_state, $node) {
  * @see webform_import_form()
  */
 function webform_import_form_submit($form, &$form_state) {
-  global $user, $base_url;
-  module_load_include('inc', 'webform', 'includes/webform.submissions');
-  $sids = array();
+
   // Define your limits for the submission here.
   $limits = array(
     'extensions' => 'csv tsv txt'
@@ -280,59 +319,139 @@ function webform_import_form_submit($form, &$form_state) {
     $keys[trim($component[$field_key])] = $component;
   }
 
-  $cids = array();
-  $fields = array();
-  if ($file = file_save_upload('upload', $validators)) {
+  if ($file = file_save_upload('upload', $validators, variable_get('webform_import_file_destination', FALSE))) {
     // This makes php auto-detect mac line endings.
     ini_set('auto_detect_line_endings', TRUE);
     if (($handle = fopen($file->destination, 'r')) !== FALSE) {
-      $data = array();
-      $num = 0;
-      $arraylen = 0;
-      $c = -1;
-      while (!feof($handle)) {
-        $c++;
-        $data = fgetcsv($handle, 0, $delimiter);
+      // Get the column headings
+      $data = fgetcsv($handle, 0, $delimiter);
+      foreach ($data as $k => &$v) {
+        $v = _webform_import_csvfieldtrim($v);
+        if (!isset($keys[$v])) {
+          drupal_set_message(t('Can not find column @k in components list, skipping.', array('@k' => $v)), 'warning');
+        }
+        elseif (isset($keys[$v]['cid'])) {
+          $cids[$k] = $keys[$v]['cid'];
+        }
+      }
 
+      $fields = array_flip($data);
+      foreach ($keys as $k => $component) {
+        if (!empty($component['mandatory']) && !isset($fields[$k])) {
+          form_set_error('upload', t('Column @k is required but could not be found in this file. Alter the file or the webform and try again.', array('@k' => $k)));
+          return;
+        }
+      }
+
+      $fields = $data;
+      $item = (object) array(
+        'filename' => $file->destination,
+        'start' => 1,
+        'limit' => FALSE,
+        'fields' => $fields,
+        'keys' => $keys,
+        'cids' => $cids,
+        'delimiter' => $delimiter,
+        'webform_nid' => $webform->nid,
+        'field_key' => $field_key,
+        'default_user' => $default_user,
+        'submission_time' => time(),
+        'remote_addr' => ip_address(),
+      );
+
+      if (variable_get('webform_import_queue_import', FALSE)) {
+        if (($handle = fopen($file->destination, 'r')) !== FALSE) {
+          $linecount = 0;
+          while (fgetcsv($handle, 0, $delimiter) !== FALSE) {
+            $linecount++;
+          }
+          fclose($handle);
+        }
+        $item->limit = variable_get('webform_import_num_per_queue', 100);
+        while ($item->start <= $linecount) {
+          webform_import_queue_create_item($item);
+          $item->start += variable_get('webform_import_num_per_queue', 100);
+        }
+        drupal_set_message(t('Upload file contained @num_lines lines that will be run @num at a time.', array('@num_lines' => $linecount, '@num' => variable_get('webform_import_num_per_queue', 100))));
+      }
+      else {
+        webform_import_process($item);
+      }
+    }
+    else {
+      form_set_error('upload', t('File could not be opened for reading.'));
+    }
+  }
+}
+
+function webform_import_queue_create_item($item) {
+  // Create the queue item.
+  $queue = DrupalQueue::get('webform_import_queue_import');
+  return $queue->createItem($item);
+}
+
+/**
+ * Parse the delimited file and add to the database.
+ *
+ * @param array $item
+ *   All variables we need for the import process.
+ */
+function webform_import_process($item) {
+
+  module_load_include('inc', 'webform', 'includes/webform.submissions');
+
+  $webform = node_load(intval($item->webform_nid));
+  $field_key = $item->field_key;
+  $default_user = $item->default_user;
+  $delimiter = $item->delimiter;
+  $filename = $item->filename;
+  $fields = $item->fields;
+  $keys = $item->keys;
+  $cids = $item->cids;
+  $sids = array();
+
+  if (!empty($filename)) {
+    // This makes php auto-detect mac line endings.
+    ini_set('auto_detect_line_endings', TRUE);
+    if ($file = new SplFileObject($filename, 'r')) {
+
+      // This conditional is required because there is a bug in SplFileObject
+      // where seek(n) followed by fgetcsv will return the wrong line.  In
+      // addition, this bug only occurs when n > 0 so n == 0 must be handled
+      // separately.  See https://bugs.php.net/bug.php?id=46569.
+      if ($item->start == 1) {
+        $file->seek(0);
+        $file->fgets();
+      }
+      elseif ($item->start > 1) {
+        $file->seek(($item->start - 1));
+      }
+
+      $current_line = $item->start;
+
+      while (($item->limit == FALSE || $current_line < ($item->start + $item->limit)) && ($data = $file->fgetcsv($delimiter))) {
+        $current_line++;
+        // If handle gets in a bad state this will keep an infinite loop from
+        // occuring and clean up after ourselves.
+        if ($data === FALSE) {
+          webform_import_log('Data was FALSE.', array(), 'error');
+          return;
+        }
         // Ignore empty rows.
         if ($data[0] === NULL) {
           continue;
         }
-        if ($c == 0 ) { // This is the header row.
-          $arraylen = count($data);
-          foreach ($data as $k => &$v) {
-            $v = _webform_import_csvfieldtrim($v);
-            if (!$keys[$v]) {
-              drupal_set_message(t('Can not find column @k in components list, skipping.', array('@k' => $v)), 'warning');
-            }
-            elseif (isset($keys[$v]['cid'])) {
-              $cids[$k] = $keys[$v]['cid'];
-            }
-          }
 
-          $fields = array_flip($data);
-
-          foreach ($keys as $k => $component) {
-            if ($component['mandatory'] && !isset($fields[$k])) {
-              form_set_error('upload', t('Column @k is required but could not be found in this file. Alter the file or the webform and try again.', array('@k' => $k)));
-            }
-          }
-
-          $fields = $data;
-
-          continue 1;
-        }
-        $num = count($data);
         $sid = NULL;
         $uid = NULL;
-        if ($arraylen == $num) {
+        if (count($data) == count($fields)) {
           $sub_array = array();
           foreach ($data as $k => &$v) {
             $v = _webform_import_csvfieldtrim($v);
             if ($v == '') {
               // Checking mandatory field for a value.
               if ($keys[$fields[$k]]['mandatory']) {
-                drupal_set_message(t('Required field has no value at row,col: @r,@c.  Skipping this row!', array('@r' => $c, '@c' => $k)), 'warning');
+                webform_import_log('Required field has no value at row,col: @r,@c.  Skipping this row!', array('@r' => $current_line, '@c' => $k), 'warning');
                 continue 2;
               }
               else {
@@ -343,7 +462,7 @@ function webform_import_form_submit($form, &$form_state) {
             // Checking SID input security.
             if ($keys[$fields[$k]]['form_key'] === 'SID') {
               if (!is_numeric($v)) {
-                drupal_set_message(t('Invalid Submission ID at row,col: @r,@c.  Skipping this row!', array('@r' => $c, '@c' => $k)), 'warning');
+                webform_import_log('Invalid Submission ID at row,col: @r,@c.  Skipping this row!', array('@r' => $current_line, '@c' => $k), 'warning');
                 continue 2;
               }
               else {
@@ -353,7 +472,7 @@ function webform_import_form_submit($form, &$form_state) {
             // Checking UID input security.
             elseif ($keys[$fields[$k]]['form_key'] === 'UID') {
               if (!is_numeric($v)) {
-                drupal_set_message(t('Invalid User ID at row,col: @r,@c.  Skipping this row!', array('@r' => $c, '@c' => $k)), 'warning');
+                webform_import_log('Invalid User ID at row,col: @r,@c.  Skipping this row!', array('@r' => $current_line, '@c' => $k), 'warning');
                 continue 2;
               }
               else {
@@ -369,7 +488,7 @@ function webform_import_form_submit($form, &$form_state) {
                   $v = $type === 'date' ? date('Y-m-d', $time) : date('H:i:s', $time);
                 }
                 else {
-                  drupal_set_message(t('Invalid datetime value at row,col: @r,@c. Skipping this row!', array('@r' => $c, '@c' => $k)), 'warning');
+                  webform_import_log('Invalid datetime value at row,col: @r,@c. Skipping this row!', array('@r' => $current_line, '@c' => $k), 'warning');
                   continue 2;
                 }
               }
@@ -385,8 +504,8 @@ function webform_import_form_submit($form, &$form_state) {
           $submission = (object) array(
             'nid' => $webform->nid,
             'uid' => ( $uid != NULL ? $uid : $default_user ),
-            'submitted' => time(),
-            'remote_addr' => ip_address(),
+            'submitted' => $item->submission_time,
+            'remote_addr' => $item->remote_addr,
             'is_draft' => FALSE,
             'data' => webform_submission_data($webform, $sub_array),
           );
@@ -401,22 +520,47 @@ function webform_import_form_submit($form, &$form_state) {
           }
         }
         else{
-          drupal_set_message(t('Row @c is malformed and will need to be fixed and resubmitted.', array('@c' => ($c+1))), 'warning');
+          webform_import_log('Row @c is malformed and will need to be fixed and resubmitted.', array('@c' => $current_line), 'warning');
         }
       }
-      fclose($handle);
-      if (!file_delete($file->destination)) {
-        watchdog('webform-import', 'File could not be deleted (cleanup process). File: %file at path %path . !details', array('%file' => $file->filename, '%path' => $file->destination, '!results' => '<br />\n<pre>' . htmlentities(print_r($form_state['values'], TRUE)) . '</pre>'), WATCHDOG_ERROR);
+      if (!variable_get('webform_import_queue_import', FALSE)) {
+        if (!file_delete($filename)) {
+          webform_import_log('File could not be deleted (cleanup process). File: %file at path %path . !details', array('%file' => $file->filename, '%path' => $file->destination, '!results' => '<br />\n<pre>' . htmlentities(print_r($form_state['values'], TRUE)) . '</pre>'), 'error');
+        }
+        webform_import_log('Submission file uploaded to %title.', array('%title' => check_plain($webform->title)));
+        webform_import_log('Uploaded @count webform submissions.', array('@count' => count($sids)));
       }
-      drupal_set_message(t('We uploaded @count sids', array( '@count' => count($sids))));
-      watchdog('webform-import', 'Submission file uploaded to %title. !details', array('%title' => check_plain($node->title), '!results' => '<br />\n<pre>'. htmlentities(print_r($form_state['values'], TRUE)) . '</pre>'));
     }
     else {
-      form_set_error('upload', t('File could not be opened for reading.'));
-      watchdog('webform-import', 'File read error. Could not read file %file at path %path.!details', array('%file' => $file->filename, '%path' => $file->filepath, '!results' => '<br />\n<pre>' . htmlentities(print_r($form_state['values'], TRUE)) . '</pre>'), WATCHDOG_ERROR);
+      webform_import_log('File read error. Could not read file %file at path %path.!details', array('%file' => $file->filename, '%path' => $file->filepath, '!results' => '<br />\n<pre>' . htmlentities(print_r($form_state['values'], TRUE)) . '</pre>'), 'error');
     }
   }
 }
+
+/**
+ * Log an entry regarding webform import and create a drupal message if appropriate.
+ */
+function webform_import_log($message, $substitutions = array(), $message_type = 'status') {
+  switch($message_type) {
+    case 'warning':
+      $watchdog_level = WATCHDOG_WARNING;
+      break;
+    case 'error':
+      $watchdog_level = WATCHDOG_ERROR;
+      break;
+    case 'status':
+    default:
+      $watchdog_level = WATCHDOG_NOTICE;
+      break;
+  }
+  if (!variable_get('webform_import_queue_import', FALSE)) {
+    drupal_set_message(t($message, $substitutions), $message_type);
+  }
+  else {
+    watchdog('webform-import', $message, $substitutions, $watchdog_level);
+  }
+}
+
 /**
  * Returns a list of value delimiters we can use.
  *
@@ -465,4 +609,20 @@ function _webform_import_csvfieldtrim($value) {
   // manually. See http://bugs.php.net/bug.php?id=31632.
   $value = str_replace('\x00..\x1F\xfe\xff', '', $value);
   return $value;
+}
+
+/**
+ * Sets up the worker for the queue.
+ *
+ * @return string
+ */
+function webform_import_cron_queue_info() {
+  $queues = array();
+  if (variable_get('webform_import_queue_import', FALSE)) {
+    $queues['webform_import_queue_import'] = array(
+      'worker callback' => 'webform_import_process',
+      'time' => 90,
+    );
+  }
+  return $queues;
 }
