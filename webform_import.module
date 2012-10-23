@@ -447,10 +447,11 @@ function webform_import_process($item) {
         if (count($data) == count($fields)) {
           $sub_array = array();
           foreach ($data as $k => &$v) {
+            $component = $keys[$fields[$k]];
             $v = _webform_import_csvfieldtrim($v);
             if ($v == '') {
               // Checking mandatory field for a value.
-              if ($keys[$fields[$k]]['mandatory']) {
+              if ($component['mandatory']) {
                 webform_import_log('Required field has no value at row,col: @r,@c.  Skipping this row!', array('@r' => $current_line, '@c' => $k), 'warning');
                 continue 2;
               }
@@ -460,7 +461,7 @@ function webform_import_process($item) {
             }
 
             // Checking SID input security.
-            if ($keys[$fields[$k]]['form_key'] === 'SID') {
+            if ($component['form_key'] === 'SID') {
               if (!is_numeric($v)) {
                 webform_import_log('Invalid Submission ID at row,col: @r,@c.  Skipping this row!', array('@r' => $current_line, '@c' => $k), 'warning');
                 continue 2;
@@ -470,7 +471,7 @@ function webform_import_process($item) {
               }
             }
             // Checking UID input security.
-            elseif ($keys[$fields[$k]]['form_key'] === 'UID') {
+            elseif ($component['form_key'] === 'UID') {
               if (!is_numeric($v)) {
                 webform_import_log('Invalid User ID at row,col: @r,@c.  Skipping this row!', array('@r' => $current_line, '@c' => $k), 'warning');
                 continue 2;
@@ -481,7 +482,7 @@ function webform_import_process($item) {
             }
             // It's a real component, parse and add to $sub_array.
             elseif (($cid = isset($cids[$k]) ? $cids[$k]:FALSE) !== FALSE) {
-              $type = $keys[$fields[$k]]['type'];
+              $type = $component['type'];
               // Date and time components.
               if ($type === 'date' || $type === 'time') {
                 if ($time = strtotime($v)) {
@@ -493,9 +494,38 @@ function webform_import_process($item) {
                 }
               }
               // Grid and multi-select components.
-              elseif ($type === 'grid' || ($type === 'select' && $keys[$fields[$k]]['extra']['multiple'] == 1)) {
-                // Explode the value into an array and associate it back to the value.
+              elseif ($type === 'grid') {
+
+                // Get the value for the grid components.
+                webform_component_include('select');
+                $options = array_flip(_webform_select_options_from_text($component['extra']['options'], TRUE));
                 $v = explode(',', $v);
+                foreach ($v as &$value) {
+                  if (!empty($options[$value])) {
+                    $value = $options[$value];
+                  }
+                }
+              }
+              elseif ($type === 'select') {
+
+                // For select options, make sure we use the key and not the values.
+                webform_component_include('select');
+                $options = array_flip(_webform_select_options($component, TRUE));
+
+                // See if there are multiple values.
+                if ($component['extra']['multiple'] == 1) {
+                  $v = explode(',', $v);
+                  foreach ($v as &$value) {
+                    if (!empty($options[$value])) {
+                      $value = $options[$value];
+                    }
+                  }
+                }
+
+                // Else if the options are set for this entry...
+                else if (!empty($options[$v])) {
+                  $v = $options[$v];
+                }
               }
               $sub_array[$cid] = $v;
             }
